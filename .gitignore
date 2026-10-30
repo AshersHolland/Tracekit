@@ -1,0 +1,33 @@
+# ---- Case data: NEVER commit evidence or case output ----
+evidence/
+working/
+output/
+timeline/
+recovered/
+findings/
+hashes/
+notes/
+report/
+screenshots/
+
+# Disk images and forensic containers
+*.dd
+*.img
+*.raw
+*.E01
+*.Ex01
+*.aff
+*.vmdk
+*.blkls
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
