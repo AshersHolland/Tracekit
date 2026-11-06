@@ -1,0 +1,4 @@
+FILE SYSTEM INFORMATION
+--------------------------------------------
+File System Type: EXT4
+Volume Name: synthetic
