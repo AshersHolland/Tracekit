@@ -1,0 +1,2 @@
+asset_name,ip_address,mac_address
+mock-web-01,10.20.30.40,aa:bb:cc:dd:ee:ff

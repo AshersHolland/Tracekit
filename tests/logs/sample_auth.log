@@ -1,0 +1,4 @@
+# fields: timestamp user source_ip status bytes_out path
+2026-04-15 09:00:00 analyst 10.20.30.40 200 1024 /reports/summary.csv
+2026-04-15 09:05:00 subject 10.20.30.40 403 0 /reports/summary.csv
+2026-04-15 09:06:00 subject 10.20.30.40 200 2048 /reports/summary.csv

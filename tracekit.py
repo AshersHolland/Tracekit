@@ -28,15 +28,21 @@ USAGE (run from your case directory, or set TRACEKIT_ROOT)
   tracekit.py cite     PATH [PATH ...]
   tracekit.py ledger
   tracekit.py versions
+  tracekit.py report [--title TEXT] [--case-id ID] [--examiner NAME] [--incident TEXT]
 
 ENVIRONMENT
   TRACEKIT_ROOT  case directory (default: current directory; CYBR_ROOT is also honoured)
   TRACEKIT_YEAR  year assumed for syslog-style timestamps that carry no year (default: current year)
 """
 import argparse, base64, collections, csv, datetime as dt, hashlib, json, os, re
+from argparse import Namespace
 import platform, shlex, shutil, subprocess, sys, tarfile, zipfile
 import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
+from tracekit_core.findings import FindingStore
+from tracekit_core.reporting import render_findings
+from tracekit_core.verification import verify_case
+from tracekit_core.workflow import stage_fixture_case
 
 __version__ = "1.0.0"
 
@@ -97,12 +103,14 @@ def sha256_file(path):
 
 def load_state():
     if os.path.exists(STATE):
-        return json.load(open(STATE))
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
     return {"ledger": []}
 
 def save_state(s):
     ensure("findings")
-    json.dump(s, open(STATE, "w"), indent=2)
+    with open(STATE, "w", encoding="utf-8") as fh:
+        json.dump(s, fh, indent=2)
 
 def need(s, *keys):
     for k in keys:
@@ -125,6 +133,10 @@ def write(path, text):
     with open(path, "w") as f:
         f.write(text)
     print("  wrote", os.path.relpath(path, ROOT))
+
+def progress(step, total, message):
+    """Print a stable, human-readable progress marker for the examiner."""
+    print("[step %d/%d] %s" % (step, total, message), flush=True)
 
 def md_table(heads, rows):
     out = ["| " + " | ".join(heads) + " |", "|" + "---|" * len(heads)]
@@ -176,6 +188,7 @@ def evpath(p, base):
 
 # --------------------------------------------------------------------- init
 def cmd_init(a):
+    progress(1, 7, "Preparing the case directory and hashing the source image")
     ensure(*DIRS)
     s = load_state()
     src = os.path.abspath(a.evidence)
@@ -208,6 +221,7 @@ def cmd_init(a):
                   "findings/tracekit.py was AI-assisted.\n")
     s.update(img=wk, evidence=ev, sha_original=h1, sha_working=h2)
 
+    progress(2, 7, "Inspecting image metadata and partition layout")
     r = sh(["img_stat", wk], P("output", "img_stat.txt"))
     r = sh(["mmls", wk], P("output", "mmls.txt"))
     parts = []
@@ -229,21 +243,28 @@ def cmd_init(a):
     print("partition offset (sectors):", off, "(derived from your own mmls output)")
     save_state(s)
 
+    progress(3, 7, "Building filesystem metadata and file listings")
     sh(tsk(s, "fsstat"), P("output", "fsstat.txt"))
     sh(tsk(s, "fls", "-r"), P("output", "file_listing.txt"))
     sh(tsk(s, "fls", "-r", "-p"), P("output", "file_listing_paths.txt"))
     sh(tsk(s, "fls", "-r", "-m", "/"), P("timeline", "bodyfile.txt"))
     sh(["mactime", "-b", P("timeline", "bodyfile.txt"), "-d", "-z", "UTC"], P("timeline", "full_timeline.csv"))
+    progress(4, 7, "Creating the filesystem timeline")
     if a.day:
         d0 = dt.date.fromisoformat(a.day)
         rng = "%s..%s" % (d0, d0 + dt.timedelta(days=1))
         sh(["mactime", "-b", P("timeline", "bodyfile.txt"), "-d", "-z", "UTC", rng], P("timeline", "incident_day.csv"))
+    progress(5, 7, "Extracting allocated files for artifact analysis")
     os.makedirs(P("recovered", "allocated"), exist_ok=True)
     sh(tsk(s, "tsk_recover", "-a") [:-1] + [s["img"], P("recovered", "allocated")])
     n = sum(len(f) for _, _, f in os.walk(P("recovered", "allocated")))
     print("allocated files extracted for analysis:", n)
-    print("listing lines:", sum(1 for _ in open(P("output", "file_listing.txt"), errors="ignore")))
+    with open(P("output", "file_listing.txt"), errors="ignore") as fh:
+        listing_lines = sum(1 for _ in fh)
+    print("listing lines:", listing_lines)
+    progress(6, 7, "Recording chain-of-custody and analysis state")
     save_state(s)
+    progress(7, 7, "Initialization complete")
     print("\nNext: tracekit.py deleted")
 
 
@@ -261,6 +282,7 @@ def istat_info(s, inode):
 
 def cmd_deleted(a):
     s = load_state(); need(s, "img", "offset")
+    progress(1, 5, "Enumerating deleted directory entries")
     r = sh(tsk(s, "fls", "-r", "-d", "-p"), P("output", "deleted_files.txt"))
     entries = []
     for l in r.stdout.decode("utf8", "replace").splitlines():
@@ -279,6 +301,7 @@ def cmd_deleted(a):
             dirs.append((t, ino, path, info))
         else:
             real.append((t, ino, path, info))
+    progress(2, 5, "Inspecting inode metadata and classifying entries")
     rec_rows = []
     for t, ino, path, info in real:
         dest = P("recovered", "deleted", *[p for p in path.split("/") if p not in ("", ".", "..")])
@@ -295,6 +318,7 @@ def cmd_deleted(a):
         e = ledger_add(s, path="/" + path, inode=ino, size=len(data), sha256=digest, state="deleted",
                        method=method, filetype=ftype)
         rec_rows.append([e["id"], "/" + path, ino, len(data), info["mtime"], info["atime"], status, digest, ftype])
+    progress(3, 5, "Recovering deleted file contents and hashing recovered artifacts")
     dir_rows = []
     for t, ino, path, info in dirs:
         lst = sh(tsk(s, "fls") [:-1] + [s["img"], str(ino)], P("output", "deleted_dir_%d.txt" % ino))
@@ -303,6 +327,7 @@ def cmd_deleted(a):
                    "directory-block slack: name '^', size 0, no data blocks"] for _, i, p, inf in slack]
     for ino in sorted({i for _, i, _, _ in slack}):
         write(P("output", "istat_%d.txt" % ino), cache[ino]["raw"])
+    progress(4, 5, "Writing the deleted-file inventory and review flags")
     save_state(s)
 
     parents = {os.path.dirname(r[1]) for r in rec_rows}
@@ -330,6 +355,7 @@ def cmd_deleted(a):
         else:
             print("Some inode recoveries were empty. Re-run with --carve and say so in the report.")
     _write_hashes(s)
+    progress(5, 5, "Deleted-file analysis complete")
 
 
 def _write_hashes(s):
@@ -397,6 +423,7 @@ def cmd_unpack(a):
     bases = [(P("recovered", "deleted"), P("findings", "csv"))]
     if a.all:
         bases.append((P("recovered", "allocated"), P("findings", "csv_allocated")))
+    progress(1, 3, "Scanning recovered artifacts for spreadsheets and archives")
     rows = []
     for base, csvdir in bases:
         for dp, _, fns in os.walk(base):
@@ -457,8 +484,11 @@ def cmd_unpack(a):
                     with open(out, newline="", errors="ignore") as fh:
                         n = sum(1 for r in csv.reader(fh) if any(c.strip() for c in r)) - 1
                     rows.append([rel(p), "csv", "%d data rows" % max(n, 0), rel(out), sha256_file(out)])
+    progress(2, 3, "Extracting supported contents and preserving hashes")
+    progress(2, 2, "Adding cited artifacts to the evidence ledger")
     save_state(s); _write_hashes(s)
     write(P("findings", "unpacked.md"), "# Unpacked evidence\n\n" + md_table(["Source", "Kind", "Size/rows", "Output", "SHA-256"], rows))
+    progress(3, 3, "Archive and spreadsheet analysis complete")
     print("unpacked items:", len(rows), "- CSVs are in findings/csv/" + (" and findings/csv_allocated/" if a.all else ""))
 
 
@@ -503,6 +533,7 @@ def row_key(r):
     return hashlib.sha1("\x1f".join(c.strip().lower() for c in r).encode("utf8", "replace")).hexdigest()
 
 def cmd_exposure(a):
+    progress(1, 4, "Selecting CSV evidence and validating the requested scope")
     ensure("findings")
     dirs = [P("findings", "csv")] + ([P("findings", "csv_allocated")] if a.include_allocated else [])
     files = a.csv or sorted(os.path.join(dp, f) for d in dirs for dp, _, fs in os.walk(d) for f in fs if f.endswith(".csv"))
@@ -513,6 +544,7 @@ def cmd_exposure(a):
             rws = read_csv_rows(f)
             print(rel(f), "->", rws[0] if rws else [])
         return
+    progress(2, 4, "Parsing rows, amounts, accounts, and sensitive fields")
     per, accounts, seen = [], set(), set()
     total_rows = 0
     grand = dedup_grand = Decimal(0); cats = {}
@@ -550,6 +582,7 @@ def cmd_exposure(a):
                 cats.setdefault(cat, set()).update("%s: %s" % (os.path.basename(f), h) for h in hits)
         per.append([os.path.basename(f), len(data), head[ai] if ai is not None else "NOT FOUND",
                     "{:,.2f}".format(tot), head[ci] if ci is not None else "NOT FOUND", len(accs), bad, within])
+    progress(3, 4, "Checking duplicate rows and overlap between evidence files")
     fl = list(keysets)
     ov = []
     for i in range(len(fl)):
@@ -580,6 +613,7 @@ def cmd_exposure(a):
            "--csv for exactly the files that were exfiltrated (default = recovered/deleted material only), and cross-check one total "
            "independently with awk or bc.\n"]
     write(P("findings", "exposure.md"), "\n".join(out))
+    progress(4, 4, "Exposure analysis complete; review column choices and duplicate totals")
     print("files %d | rows %d | $%s | accounts %d | unique rows %d ($%s after exact-duplicate removal) | overlapping file pairs %d"
           % (len(per), total_rows, "{:,.2f}".format(grand), len(accounts), len(seen), "{:,.2f}".format(dedup_grand), len(ov)))
     if any(o[2] for o in ov):
@@ -626,7 +660,8 @@ def map_cols(names):
     return m
 
 def parse_log(path):
-    lines = open(path, errors="ignore").read().splitlines()
+    with open(path, errors="ignore") as fh:
+        lines = fh.read().splitlines()
     hdr = [l for l in lines if l.startswith("#")]
     body = [l for l in lines if l.strip() and not l.startswith("#")]
     names = layout(hdr); cm = map_cols(names) if names else {}
@@ -669,8 +704,10 @@ def log_files():
             yield p
 
 def cmd_logs(a):
+    progress(1, 3, "Locating recovered log artifacts")
     out = ["# Log profile (generated by tracekit)\n", "Comment lines beginning with # are read as layout and excluded from every count.\n"]
     profiles = {}
+    progress(2, 3, "Parsing timestamps, users, addresses, statuses, and byte counts")
     for p in sorted(log_files()):
         hdr, recs, names = parse_log(p)
         if not recs:
@@ -713,6 +750,7 @@ def cmd_logs(a):
         out.append("Interpretation is yours: compare hours, volume, request mix and status progression "
                    "(for example denied-then-allowed) between the account whose job is this work and the subject.\n")
     write(P("findings", "log_profile.md"), "\n".join(out))
+    progress(3, 3, "Log profiling complete; compare baseline and subject behavior")
     print("profiled %d logs -> findings/log_profile.md" % len(profiles))
 
 
@@ -724,6 +762,7 @@ def fingerprint(blob):
         return "RAW:" + blob[:28]
 
 def cmd_pivot(a):
+    progress(1, 3, "Scanning text artifacts for IPs, MACs, host keys, and names")
     base = P("recovered", "allocated")
     files = list(text_files(base, P("recovered", "deleted"), P("working", "unpacked")))
     ids = collections.defaultdict(lambda: collections.Counter())
@@ -732,10 +771,13 @@ def cmd_pivot(a):
     names = collections.defaultdict(set)
     inventory = set()
     dossier = collections.defaultdict(list)
+    progress(2, 3, "Correlating identifiers across artifacts and asset inventories")
     for p in files:
         isinv = "asset" in os.path.basename(p).lower() or "inventory" in os.path.basename(p).lower()
         low = os.path.basename(p).lower()
-        for n, l in enumerate(open(p, errors="ignore").read().splitlines(), 1):
+        with open(p, errors="ignore") as fh:
+            lines = fh.read().splitlines()
+        for n, l in enumerate(lines, 1):
             ips, macs, fps = IP_RE.findall(l), [m.lower().replace("-", ":") for m in MAC_RE.findall(l)], FP_RE.findall(l)
             if isinv:
                 inventory.update(ips); inventory.update(macs)
@@ -802,6 +844,7 @@ def cmd_pivot(a):
             out.append("### %s\n" % ip)
             out.append(md_table(["Artifact", "Line", "Text"], hits))
     write(P("findings", "pivot.md"), "\n".join(out))
+    progress(3, 3, "Identifier pivot complete; validate each lead against independent evidence")
     n_share = len([r for r in ipmap.values() if len(r) > 1])
     print("MACs with >1 IP: %d | shared host keys: %d" % (n_share, len([1 for v in hostkeys.values() if len(v) > 1])))
 
@@ -819,10 +862,14 @@ def cmd_volume(a):
         needles.append(re.compile(a.match))
     srcs = [os.path.abspath(x) for x in a.logs] if a.logs else [p for p in log_files()]
     rx = [re.compile(a.field, re.I)] if a.field else BYTES_RES
+    progress(1, 3, "Selecting log sources and validating the matching criteria")
     rows, totals, samples = [], {}, []
+    progress(2, 3, "Summing matching byte fields and retaining sample lines")
     for p in srcs:
         tot, n, nobytes, sample = 0, 0, 0, []
-        for l in open(p, errors="ignore"):
+        with open(p, errors="ignore") as fh:
+            lines = fh.readlines()
+        for l in lines:
             if l.startswith("#") or not all(r.search(l) for r in needles):
                 continue
             if a.date and a.date not in l and not (parse_ts(l, int(a.date[:4])) or "").startswith(a.date):
@@ -857,6 +904,7 @@ def cmd_volume(a):
                    "subsystems (for example the network log vs. the transfer tool's own log); two lines of one log do not count. "
                    "State the subsystem for each in the report.\n" % (100.0 * (hi - lo) / hi if hi else 0))
     write(P("findings", "volume_%s.md" % re.sub(r"\W+", "_", a.ip or a.match)), "\n".join(out))
+    progress(3, 3, "Volume analysis complete; confirm direction and subsystem independence")
     for r in rows:
         print(r[0], r[3], "bytes", "(%d lines, %d matched without a byte field)" % (r[1], r[2]))
     if not rows:
@@ -865,8 +913,10 @@ def cmd_volume(a):
 
 # -------------------------------------------------------------------- stomp
 def cmd_stomp(a):
+    progress(1, 4, "Reading filesystem timestamps and estimating image-build timing")
     s = load_state(); need(s, "img")
-    body = [l.rstrip("\n").split("|") for l in open(bodyfile(), errors="ignore") if l.count("|") >= 10]
+    with open(bodyfile(), errors="ignore") as fh:
+        body = [l.rstrip("\n").split("|") for l in fh if l.count("|") >= 10]
     rec = []
     for f in body:
         try:
@@ -877,10 +927,13 @@ def cmd_stomp(a):
     build = max((r["c"] for r in rec), default=0)
     logs = [r["m"] for r in rec if r["name"].startswith("/var/log/") and not r["name"].endswith("(deleted)") and r["m"] > 0]
     epoch = int(dt.datetime.fromisoformat(a.epoch).replace(tzinfo=dt.timezone.utc).timestamp()) if a.epoch else (min(logs) if logs else 0)
+    progress(2, 4, "Comparing file timestamps with log chronology and file content")
     first_seen = {}
     for p in text_files(P("recovered", "allocated")):
         if "/var/log/" in p:
-            for l in open(p, errors="ignore"):
+            with open(p, errors="ignore") as fh:
+                log_lines = fh.readlines()
+            for l in log_lines:
                 t = parse_ts(l, a.year)           # year needed for syslog-style lines such as auth.log
                 if t and ISO_RE.match(t):
                     for ip in IP_RE.findall(l):
@@ -899,12 +952,15 @@ def cmd_stomp(a):
         if scriptish and epoch and r["m"] < epoch and (a.include_system or not sysdir):
             why.append("script/executable mtime (%s) predates the earliest log mtime (%s)" % (ts(r["m"]), ts(epoch)))
         if os.path.isfile(p) and is_text(p) and os.path.getsize(p) < 2 << 20:
-            for ip in set(IP_RE.findall(open(p, errors="ignore").read())):
+            with open(p, errors="ignore") as fh:
+                content = fh.read()
+            for ip in set(IP_RE.findall(content)):
                 fs_ = first_seen.get(ip)
                 if fs_ and fs_ > ts(r["m"]):
                     why.append("references %s, which first appears in logs at %s, AFTER this file's mtime" % (ip, fs_))
         if why:
             flags.append([r["name"], r["inode"], ts(r["a"]) if r["a"] else "", ts(r["m"]), ts(r["c"]), "; ".join(why)])
+    progress(3, 4, "Writing timestamp contradiction flags")
     out = ["# Timestamp consistency check (generated by tracekit)\n",
            "Image-build time estimated from the latest ctime: **%s UTC**. On this image ctime and dtime reflect image construction, "
            "not the scenario, so they cannot date events; the useful test is whether atime/mtime contradict the file's role or content. "
@@ -913,13 +969,17 @@ def cmd_stomp(a):
            "Flags are leads. For each one you keep, run `istat`, state which timestamp exposes the problem, and explain why the others "
            "cannot be trusted.\n"]
     write(P("findings", "timestamp_flags.md"), "\n".join(out))
+    progress(4, 4, "Timestamp consistency analysis complete")
     print("flagged %d entries -> findings/timestamp_flags.md" % len(flags))
 
 
 # --------------------------------------------------------------------- fuse
 def cmd_fuse(a):
+    progress(1, 3, "Reading filesystem and log timestamps")
     ev = []
-    for l in open(bodyfile(), errors="ignore"):
+    with open(bodyfile(), errors="ignore") as fh:
+        body_lines = fh.readlines()
+    for l in body_lines:
         f = l.rstrip("\n").split("|")
         if len(f) < 11: continue
         try:
@@ -930,13 +990,16 @@ def cmd_fuse(a):
         except ValueError:
             pass
     for p in log_files():
-        for n, l in enumerate(open(p, errors="ignore"), 1):
+        with open(p, errors="ignore") as fh:
+            log_lines = fh.readlines()
+        for n, l in enumerate(log_lines, 1):
             if l.startswith("#"): continue
             t = parse_ts(l, a.year)
             if t:
                 ev.append((t, "log", rel(p), l.strip()[:200], ""))
     if a.frm: ev = [e for e in ev if e[0] >= a.frm]
     if a.to: ev = [e for e in ev if e[0] <= a.to + " 23:59:59"]
+    progress(2, 3, "Merging and filtering events into one UTC timeline")
     ev.sort()
     ensure("timeline")
     with open(P("timeline", "fused_timeline.csv"), "w", newline="") as f:
@@ -948,11 +1011,13 @@ def cmd_fuse(a):
           "# Draft timeline scaffold (generated by tracekit)\n\nBusiest 10-minute log windows. Open fused_timeline.csv at each time, choose the "
           "significant events yourself, and fill in the artifact, inode, phase and confidence.\n\n"
           + md_table(["Window", "Log lines", "Event you identify", "Artifact / inode", "Phase", "Confidence"], rows))
+    progress(3, 3, "Timeline fusion complete; review the incident scaffold")
     print("fused %d events -> timeline/fused_timeline.csv; scaffold in timeline/incident_timeline_draft.md" % len(ev))
 
 
 # --------------------------------------------------------------- cite/ledger
 def cmd_cite(a):
+    progress(1, 2, "Locating requested artifacts and recovering their bytes")
     s = load_state(); need(s, "img", "offset")
     rows = []
     for path in a.paths:
@@ -969,6 +1034,7 @@ def cmd_cite(a):
     print(md_table(["ID", "Path", "Inode", "Bytes", "SHA-256"], rows))
 
 def cmd_ledger(a):
+    progress(1, 1, "Writing the evidence ledger and recovered-artifact hash list")
     s = load_state()
     rows = [[e["id"], e["path"], e.get("inode", ""), e["size"], e["state"], e["sha256"], e.get("method", "")] for e in s["ledger"]]
     t = md_table(["ID", "Path", "Inode", "Size (B)", "State", "SHA-256", "Method"], rows)
@@ -976,9 +1042,148 @@ def cmd_ledger(a):
     _write_hashes(s); print(t)
 
 
+# -------------------------------------------------------------------- report
+def cmd_report(a):
+    """Assemble the generated evidence and findings into one examiner-ready report."""
+    progress(1, 4, "Collecting case metadata, provenance, and generated findings")
+    ensure("report")
+    s = load_state()
+    finding_order = [
+        "evidence_table.md", "deleted_inventory.md", "unpacked.md", "exposure.md",
+        "log_profile.md", "pivot.md", "timestamp_flags.md",
+    ]
+    findings = []
+    for name in finding_order:
+        path = P("findings", name)
+        if os.path.isfile(path):
+            with open(path, errors="replace") as fh:
+                findings.append((name, fh.read()))
+    for name in sorted(os.listdir(P("findings")) if os.path.isdir(P("findings")) else []):
+        if name.endswith(".md") and name not in {n for n, _ in findings}:
+            path = P("findings", name)
+            with open(path, errors="replace") as fh:
+                findings.append((name, fh.read()))
+
+    expected = [
+        ("Original hash", "hashes/original_hash.txt"),
+        ("Working-copy hash", "hashes/working_hash.txt"),
+        ("Chain of custody", "notes/chain_of_custody.md"),
+        ("Command log", "notes/command_log.md"),
+        ("Tool versions", "findings/tool_versions.md"),
+        ("Evidence ledger", "findings/evidence_table.md"),
+        ("Fused timeline", "timeline/fused_timeline.csv"),
+        ("Investigation manifest", "findings/manifest.json"),
+    ]
+    status_rows = [[label, "Present" if os.path.exists(P(path)) else "Missing", path]
+                   for label, path in expected]
+    progress(2, 4, "Summarizing integrity checks and investigation coverage")
+    integrity = [
+        ["Original image", s.get("evidence", "not initialized"), s.get("sha_original", "not recorded")],
+        ["Working image", s.get("img", "not initialized"), s.get("sha_working", "not recorded")],
+        ["Partition offset", s.get("offset", "not recorded"), "sectors"],
+        ["Ledger entries", len(s.get("ledger", [])), "artifacts"],
+    ]
+    title = a.title or "Tracekit forensic investigation report"
+    generated = now()
+    header = [
+        "# %s\n" % title,
+        "**Generated:** %s  \n**Case ID:** %s  \n**Examiner:** %s  \n**Incident:** %s\n" %
+        (generated, a.case_id or "not provided", a.examiner or "not provided", a.incident or "not provided"),
+        "> This report is an evidence-organizing draft generated from Tracekit outputs. "
+        "It does not replace examiner judgment. Every lead must be validated against the cited artifact, "
+        "an independent source, an alternative explanation, and a stated confidence level.\n",
+        "## Executive summary\n\n"
+        "Complete this section after reviewing the findings below. State only conclusions supported by the evidence, "
+        "separate facts from interpretation, identify the most important timeline, attribution, and impact findings, "
+        "and name the weakest link or unresolved contradiction.\n",
+        "## Scope and method\n\n"
+        "Tracekit preserves the source image hash, working-copy hash, command history, tool versions, recovered-artifact "
+        "hashes, filesystem metadata, deleted-file results, archive contents, log profiles, identifier pivots, "
+        "timestamp checks, and fused timeline outputs. The exact commands and return codes are in `../notes/command_log.md`.\n",
+        "## Integrity and provenance\n\n" + md_table(["Item", "Value", "Detail"], integrity) +
+        "\n" + md_table(["Record", "Status", "Path"], status_rows),
+        "## Investigation coverage\n\n"
+        "The following generated findings are included in this report. A missing section means that analysis was not run "
+        "or did not produce an output; do not treat absence as a negative finding.\n",
+    ]
+    progress(3, 4, "Embedding findings with source paths and examiner review prompts")
+    sections = []
+    for name, body in findings:
+        section_name = name[:-3] if name.endswith(".md") else name
+        sections.append("### %s\n\n%s\n\n**Examiner review:** identify the strongest supported fact, "
+                        "the relevant source path/line or evidence ID, confidence, alternative explanation, "
+                        "and follow-up action.\n" % (section_name.replace("_", " "), body))
+    footer = [
+        "## Conclusions and recommendations\n\n"
+        "Record conclusions in ranked order. For each conclusion include: claim, supporting evidence IDs, "
+        "timeline bounds, confidence, limitations, and the next action needed to resolve uncertainty.\n\n"
+        "## Open questions and limitations\n\n"
+        "- Which important artifacts were unavailable, unreadable, or only heuristically parsed?\n"
+        "- Which timestamps may reflect image construction rather than incident activity?\n"
+        "- Which totals may contain legitimate repeats or double-counted rows?\n"
+        "- Which identifiers require corroboration from a different subsystem?\n"
+        "- What evidence would falsify each major conclusion?\n\n"
+        "## Appendix: generated artifacts\n\n"
+        "Use `notes/command_log.md`, `notes/chain_of_custody.md`, `hashes/`, `output/`, `timeline/`, "
+        "`recovered/`, and `findings/` to reproduce and audit this report.\n",
+    ]
+    structured = FindingStore(P("findings", "structured_findings.json"))
+    if os.path.exists(structured.path):
+        structured.load()
+        sections.insert(0, "### Structured findings\n\n%s\n" %
+                        render_findings(structured.as_dicts()))
+    progress(4, 4, "Writing the final investigation report")
+    report_path = P("report", "tracekit_report.md")
+    write(report_path, "".join(header + sections + footer))
+    print("report complete ->", rel(report_path))
+
+
+# ---------------------------------------------------------------------- verify
+def cmd_verify(a):
+    progress(1, 2, "Checking required provenance, ledger, command log, and report outputs")
+    result = verify_case(ROOT)
+    progress(2, 2, "Verification complete")
+    print("checked:", result.checked)
+    for warning in result.warnings:
+        print("WARNING:", warning)
+    for failure in result.failures:
+        print("FAIL:", failure)
+    if not result.passed:
+        sys.exit(1)
+    print("verification passed")
+
+
+# ------------------------------------------------------------------------ demo
+def cmd_demo(a):
+    progress(1, 5, "Staging synthetic investigation artifacts")
+    log_row("py", "tracekit.py demo")
+    repo = os.path.dirname(os.path.abspath(__file__))
+    manifest = stage_fixture_case(
+        ROOT,
+        os.path.join(repo, "tests", "mock_data"),
+        os.path.join(repo, "tests", "logs"),
+        a.case_id or "DEMO-001",
+    )
+    manifest.record_command("tracekit.py demo", 0)
+    manifest.save(P("findings", "manifest.json"))
+    progress(2, 5, "Running synthetic exposure analysis")
+    cmd_exposure(Namespace(csv=None, list_columns=False, amount_col=None,
+                           account_col=None, include_allocated=False))
+    progress(3, 5, "Running synthetic log profiling")
+    cmd_logs(Namespace(baseline="analyst", subject="subject"))
+    progress(4, 5, "Writing the evidence ledger and investigation report")
+    cmd_ledger(Namespace())
+    cmd_report(Namespace(title=a.title or "Tracekit synthetic demonstration",
+                         case_id=manifest.case_id, examiner="demo",
+                         incident="Synthetic fixture validation"))
+    progress(5, 5, "Demo complete; checking generated outputs")
+    cmd_verify(Namespace())
+
+
 # ----------------------------------------------------------------- versions
 def cmd_versions(a):
     """Record the version and path of every tool the kit (and the template) relies on (for the report's tool table)."""
+    progress(1, 1, "Recording versions and executable paths for all investigation tools")
     tools = [("sha256sum", ["--version"]), ("mmls", ["-V"]), ("img_stat", ["-V"]), ("fsstat", ["-V"]), ("fls", ["-V"]),
              ("istat", ["-V"]), ("icat", ["-V"]), ("ifind", ["-V"]), ("tsk_recover", ["-V"]), ("mactime", ["-V"]),
              ("blkls", ["-V"]), ("foremost", ["-V"]), ("file", ["--version"]), ("unzip", ["-v"]), ("tar", ["--version"]),
@@ -1027,8 +1232,18 @@ def main():
     x = sp.add_parser("cite"); x.add_argument("paths", nargs="+"); x.set_defaults(f=cmd_cite)
     x = sp.add_parser("ledger"); x.set_defaults(f=cmd_ledger)
     x = sp.add_parser("versions"); x.set_defaults(f=cmd_versions)
+    x = sp.add_parser("report", help="assemble findings into a review-ready Markdown report")
+    x.add_argument("--title"); x.add_argument("--case-id", dest="case_id")
+    x.add_argument("--examiner"); x.add_argument("--incident")
+    x.set_defaults(f=cmd_report)
+    x = sp.add_parser("verify", help="verify required case outputs and provenance records")
+    x.set_defaults(f=cmd_verify)
+    x = sp.add_parser("demo", help="run a complete synthetic investigation workflow")
+    x.add_argument("--case-id"); x.add_argument("--title")
+    x.set_defaults(f=cmd_demo)
     a = ap.parse_args()
     log_row("py", "tracekit.py " + " ".join(shlex.quote(x) for x in sys.argv[1:]))   # every invocation is on record
+    print("\nTRACEKIT: starting '%s' in %s" % (a.cmd, ROOT), flush=True)
     a.f(a)
 
 if __name__ == "__main__":

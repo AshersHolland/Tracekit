@@ -1,0 +1,4 @@
+# network subsystem
+2026-04-15 09:00:00 src=10.20.30.40 bytes_out=1024 endpoint=/reports/summary.csv
+2026-04-15 09:05:00 src=10.20.30.40 bytes_out=2048 endpoint=/reports/summary.csv
+2026-04-15 09:15:00 src=10.20.30.99 bytes_out=9999 endpoint=/other
